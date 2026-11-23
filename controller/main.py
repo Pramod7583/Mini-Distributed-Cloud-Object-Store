@@ -296,20 +296,96 @@ async def startup():
 # ──────────────────────────────────────────────────────────────────────────────
 
 @app.post("/internal/workers/register", status_code=200)
-async def register_worker(request: Request):
+async def register_worker(request: Request, background_tasks: BackgroundTasks):
     body = await request.json()
     worker_id = body.get("worker_id")
     url = body.get("url")
     if not worker_id or not url:
         raise HTTPException(400, "worker_id and url required")
 
+    existing_chunks: List[str] = body.get("existing_chunks", [])
+
     workers[worker_id] = {
         "url": url,
         "last_heartbeat": time.time(),
-        "chunk_count": 0,
+        "chunk_count": len(existing_chunks),
     }
-    logger.info("Worker registered: %s @ %s", worker_id, url)
+    logger.info("Worker registered: %s @ %s (reported %d chunks)", worker_id, url, len(existing_chunks))
+
+    if existing_chunks:
+        background_tasks.add_task(_reconcile_worker_chunks, worker_id, url, existing_chunks)
+
     return {"status": "registered", "worker_id": worker_id}
+
+
+async def _reconcile_worker_chunks(worker_id: str, worker_url: str, reported_chunks: List[str]) -> None:
+    """
+    Called in the background after a worker re-registers.
+
+    For every chunk_id the worker reports on disk:
+      Case A — Unreferenced (no active object owns it):
+              DELETE it from the worker (orphaned / deleted-object leftover).
+      Case B — Referenced chunk, but worker_id is NOT in chunk_locations
+               and the chunk already has >= REPLICATION_FACTOR healthy replicas:
+              DELETE it from the worker (excess / stale replica from re-replication).
+      Case C — Referenced chunk, worker_id NOT in chunk_locations,
+               and the chunk has < REPLICATION_FACTOR healthy replicas:
+              Re-attach worker_id to chunk_locations (avoid duplicate).
+      Case D — Referenced chunk, worker_id already in chunk_locations:
+              Keep — nothing to do.
+    """
+    # Build a fast lookup: chunk_id → (object record, chunk record)
+    chunk_index: Dict[str, Any] = {}
+    for obj in objects.values():
+        for chunk in obj.get("chunks", []):
+            chunk_index[chunk["chunk_id"]] = chunk
+
+    alive_now = {w["worker_id"] for w in alive_workers()}
+
+    for chunk_id in reported_chunks:
+        chunk = chunk_index.get(chunk_id)
+
+        # ── Case A: orphaned chunk (no active object references it) ──────────
+        if chunk is None:
+            logger.info(
+                "Reconcile %s: chunk %s is orphaned (no active object) — deleting",
+                worker_id, chunk_id,
+            )
+            await worker_delete_chunk(worker_url, chunk_id)
+            continue
+
+        # Collect currently live locations (excluding newly registered worker itself
+        # since it may not be in locations list yet)
+        live_locs = [
+            loc for loc in chunk.get("locations", [])
+            if loc["worker_id"] != worker_id and loc["worker_id"] in alive_now
+        ]
+        already_in_locs = any(loc["worker_id"] == worker_id for loc in chunk.get("locations", []))
+
+        if already_in_locs:
+            # ── Case D: worker is already the legitimate owner ────────────────
+            logger.debug("Reconcile %s: chunk %s already in locations — keeping", worker_id, chunk_id)
+            continue
+
+        # Worker is NOT in locations (it was replaced during re-replication)
+        healthy_replica_count = len(live_locs)
+
+        if healthy_replica_count >= REPLICATION_FACTOR:
+            # ── Case B: excess copy — delete the stale replica ────────────────
+            logger.info(
+                "Reconcile %s: chunk %s has %d healthy replicas (>= RF=%d) — deleting stale copy",
+                worker_id, chunk_id, healthy_replica_count, REPLICATION_FACTOR,
+            )
+            await worker_delete_chunk(worker_url, chunk_id)
+        else:
+            # ── Case C: under-replicated — re-attach this worker ─────────────
+            worker_info = workers.get(worker_id)
+            if worker_info:
+                chunk["locations"].append({"worker_id": worker_id, "url": worker_url})
+                logger.info(
+                    "Reconcile %s: chunk %s re-attached (had %d healthy replica(s))",
+                    worker_id, chunk_id, healthy_replica_count,
+                )
 
 
 @app.post("/internal/workers/heartbeat", status_code=200)
@@ -515,10 +591,25 @@ async def delete_object(object_id: str, background_tasks: BackgroundTasks):
 
     async def _delete_chunks():
         for chunk_info in obj["chunks"]:
+            chunk_id = chunk_info["chunk_id"]
+
+            # Primary: delete from all recorded replica locations
+            primary_worker_ids = {loc["worker_id"] for loc in chunk_info["locations"]}
             for loc in chunk_info["locations"]:
                 worker = workers.get(loc["worker_id"])
                 if worker:
-                    await worker_delete_chunk(worker["url"], chunk_info["chunk_id"])
+                    await worker_delete_chunk(worker["url"], chunk_id)
+
+            # Broadcast: also send best-effort DELETE to any OTHER alive worker
+            # that is NOT already in chunk_locations, to sweep out stale copies
+            # left behind from previous re-replication cycles.
+            for wid, w in workers.items():
+                if wid in primary_worker_ids:
+                    continue  # already handled above
+                if time.time() - w["last_heartbeat"] >= HEARTBEAT_TIMEOUT:
+                    continue  # skip dead workers
+                await worker_delete_chunk(w["url"], chunk_id)
+                # 404 responses are already treated as success in worker_delete_chunk
 
     background_tasks.add_task(_delete_chunks)
     return Response(status_code=204)

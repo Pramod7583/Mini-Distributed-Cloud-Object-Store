@@ -37,22 +37,35 @@ Client(s)
 
 ## Project Structure
 
-```
+```text
 cloud-project/
-├── controller/
+├── controller/             # Controller FastAPI node & Docker config
+├── deploy/                 # Deployment configurations
+├── docs/                   # Project documentation
+├── scripts/                # Utility & helper scripts
+├── shared/                 # Shared schemas, constants & utilities
+├── tests/                  # Automated test suite
+│   ├── data_integrity/
+│   ├── download/
+│   ├── failure_recovery/
+│   ├── integration/
+│   ├── replication/
+│   ├── upload/
+│   ├── conftest.py
+│   ├── requirements-test.txt
+│   └── test_controller.py
+├── worker/                 # Storage worker node & Docker config
+│   ├── app/
+│   ├── tests/
 │   ├── Dockerfile
-│   ├── main.py          # Controller FastAPI app
+│   ├── main.py
 │   └── requirements.txt
-├── worker/
-│   ├── Dockerfile
-│   ├── main.py          # Worker FastAPI app
-│   └── requirements.txt
-├── docker-compose.yml
-├── client.py            # CLI client
-├── demo.py              # Full demonstration script
+├── client.py               # CLI client
+├── demo.py                 # Full end-to-end demonstration script
+├── docker-compose.yml      # Multi-container orchestration (1 controller + 4 workers)
+├── pytest.ini              # Pytest configuration
 └── README.md
 ```
-
 ---
 
 ## Quick Start
